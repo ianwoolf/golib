@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 const (
 	ChanMode   = "channel"
+	IoMode     = "io"
 	StringMode = "string"
 )
 
@@ -21,6 +23,7 @@ type Tar struct {
 	OriPath string
 	Prepare sync.WaitGroup
 	Job     sync.WaitGroup
+	Gw      *gzip.Writer
 
 	Tw *tar.Writer
 
@@ -54,16 +57,95 @@ func (t *Tar) init(num int) error {
 	return nil
 }
 
-func (t *Tar) Run(mode string) error {
+func (t *Tar) InitIo(w io.Writer) error {
+	if t.Tw != nil {
+		t.Tw.Close()
+	}
+	if t.Gw != nil {
+		t.Gw.Close()
+	}
+	// t.Gw = gzip.NewWriter(w)
+	t.Tw = tar.NewWriter(w)
+	return nil
+}
+
+func (t *Tar) Run(mode string, w ...io.Writer) error {
 	switch mode {
 	case ChanMode:
 		t.Prepare.Add(1)
 		go t.ChanTar()
 		t.Prepare.Wait()
+	case IoMode:
+		if len(w) != 1 {
+			return fmt.Errorf("iomode require one io.writer param")
+		}
+		t.InitIo(w[0])
+		go t.IoTar()
 	default:
 		return fmt.Errorf("invalid mode")
 	}
 	return nil
+}
+
+func (t *Tar) Close() {
+	close(t.Ch)
+	close(t.JobDone)
+	close(t.CloseDone)
+
+	// t.Gw.Close()
+	// t.Tw.Close()
+}
+
+// func (t *Tar) Write(text string) {
+// 	t.Job.Add(1)
+// 	content := Content{
+// 		Text: []byte(text),
+// 	}
+// 	t.Ch <- content
+// }
+
+// func (t *Tar) Tar() {
+// 	t.Job.Add(1)
+// 	t.StartTar <- true
+// }
+
+func (t *Tar) IoTar() {
+	defer sendBoolChan(t.CloseDone, true)
+	for {
+		var done bool = false
+		select {
+		case content := <-t.Ch:
+			header := new(tar.Header)
+			header.Name = content.FileName
+			header.Size = int64(len(string(content.Text)))
+			header.Mode = content.Mode
+			if year, _, _ := content.ModTime.Date(); year == 1 {
+				header.ModTime = time.Now()
+			}
+
+			if err := t.Tw.WriteHeader(header); err != nil {
+				// todo error
+				fmt.Println(err.Error())
+				return
+				// break
+			}
+			if _, err := t.Tw.Write(content.Text); err != nil {
+				fmt.Println(err.Error())
+				return
+				// break
+			}
+			t.Job.Done()
+		case <-t.JobDone:
+			done = true
+			break
+		}
+		if done {
+			// t.Gw.Close()
+			t.Tw.Close()
+			break
+		}
+	}
+	return
 }
 
 func (t *Tar) ChanTar() {
@@ -74,10 +156,10 @@ func (t *Tar) ChanTar() {
 	}
 	defer fw.Close()
 	// if t.Gz {
-	gw := gzip.NewWriter(fw)
-	defer gw.Close()
+	t.Gw = gzip.NewWriter(fw)
+	defer t.Gw.Close()
 
-	t.Tw = tar.NewWriter(gw)
+	t.Tw = tar.NewWriter(t.Gw)
 	// }
 	defer t.Tw.Close()
 
@@ -99,21 +181,16 @@ func (t *Tar) ChanTar() {
 			if year, _, _ := content.ModTime.Date(); year == 1 {
 				header.ModTime = time.Now()
 			}
-
 			if err := t.Tw.WriteHeader(header); err != nil {
 				// todo error
 				fmt.Println(err.Error())
 				return
 				// break
-			} else {
-				fmt.Println("write header success")
 			}
 			if _, err := t.Tw.Write(content.Text); err != nil {
 				fmt.Println(err.Error())
 				return
 				// break
-			} else {
-				fmt.Println("wirte content success")
 			}
 			t.Job.Done()
 		case <-t.JobDone:
